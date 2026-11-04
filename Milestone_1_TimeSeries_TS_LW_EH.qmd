@@ -1,0 +1,126 @@
+---
+title: "Milestone 1: Time Series"
+author: "Elijah Homan, Logan Worrell, Thomas Shields"
+format: 
+  html:
+    embed-resources: true
+---
+
+## Team Charter
+
+##### Names and Ways to reach each other
+- Elijah Homan: Text or Call
+- Logan Worrell: Text or Email
+- Thomas Shields: Text or Call or Email
+
+##### When and how we'll meet
+Meet once a week on Tuesdays at 1:45 in person, location TBD
+
+##### How code will be shared
+Code will be shared using Github
+
+##### Who is the coordinator for the milestones
+- Milestone 1: Thomas
+- Milestone 2: Eli
+- Milestone 3: Thomas
+- Milestone 4: Eli
+- Milestone 5: Logan
+
+##### What to do if someone misses
+- Has to buy the other two donuts if they miss
+
+## Data
+##### Question to Answer
+- The question we want to answer, is if the number of injuries per week in the NFL has changed over time. The NFL and NFL Players Association (NFLPA) would care about this question, as they are trying to make the game safer. Thus, they would care about how much their players are getting injured, and if injuries are on the rise or fall. 
+
+##### The data source (with a link), the variable(s), units, frequency, and time span.
+The primary data source for this project is [nflverse](https://github.com/nflverse/nflverse-data), an open-source project that provides historical NFL data. The injury reports will be downloaded using the `nflreadr` R package. The dataset contains information about player injuries, including the season, week, team, and reported injury.
+
+The analysis will use data from the 2016–2025 NFL seasons, providing ten seasonal cycles.
+
+- **Main variable:** Number of injury-report records per week.
+- **Units:** Injury-report records.
+- **Frequency:** Weekly, by NFL regular-season week.
+- **Time span:** 2016–2025.
+- **Seasonal cycles:** Ten NFL seasons.
+
+The weekly totals will be calculated by counting injury-report records for each season and week, excluding reports identified as resting-player reports. These counts represent injury reports rather than necessarily distinct new injuries, since a player may appear on multiple reports.
+
+##### A single time plot of your series made with autoplot(), with a descriptive title and labeled axes.
+
+The following time plot displays the number of NFL injury reports by season and week from 2016 through 2025. The x-axis identifies each week chronologically, while the y-axis shows the number of injury reports recorded during that week.
+
+```{r}
+#| label: building_data
+#| echo: true
+#| warning: false
+
+library(nflreadr)
+library(tidyverse)
+library(fpp3)
+
+# Load seasons
+injuries <- load_injuries(2016:2025)
+
+weekly_injuries <- injuries |>
+  filter(week <= 17) |>
+  filter(report_primary_injury !=
+           "Not injury related - resting player") |>
+  group_by(season, week) |>
+  summarise(
+    injury_reports = n(),
+    .groups = "drop"
+  ) |>
+  arrange(season, week) |>
+  mutate(
+    time = row_number(),
+    week_label = paste0(season, " W", week)
+  ) |>
+  as_tsibble(index = time)
+```
+
+```{r}
+#| label: fig-nfl-injuries
+#| fig-cap: "Weekly NFL Injury Reports, 2016–2025"
+#| fig-width: 12
+#| fig-height: 6
+
+weekly_injuries |>
+  autoplot(injury_reports) +
+  scale_x_continuous(
+    breaks = weekly_injuries$time[weekly_injuries$week == 1],
+    labels = weekly_injuries$season[weekly_injuries$week == 1]
+  ) +
+  labs(
+    title = "Weekly NFL Injury Reports, 2016–2025",
+    x = "NFL Season",
+    y = "Number of Injury Reports"
+  ) +
+  theme_minimal()
+```
+
+The plot will help identify changes in injury-report volume throughout each season and determine whether recurring patterns exist across seasons.
+
+##### Your forecast horizon — how far ahead you will forecast and why that horizon matters to your decision-maker.
+
+The forecasting horizon will be 17 weeks, representing the first 17 weeks of an NFL regular season. This horizon is appropriate because it provides a full season's worth of forecasts, which could help NFL teams anticipate injury-report volume and plan medical staffing and other resources. Since injury reports may vary throughout the season, the forecasts will need to account for seasonal patterns and uncertainty. Forecast accuracy can be evaluated by comparing forecasts with actual injury-report counts from a season excluded from model training.
+
+##### A backup dataset, in case your first choice does not work out.
+
+If the NFL injury-report data prove unsuitable for forecasting, the backup dataset will consist of NBA player injury reports.
+
+A potential source is [Kaggle's NBA Injury Data collection](https://www.kaggle.com/search?q=NBA+injury+data), where historical NBA injury datasets can be investigated. The specific dataset selected will need to be checked for completeness, consistency, and sufficient historical coverage before use.
+
+The proposed variables and structure are:
+
+- **Main variable:** Number of NBA injury-report records per week.
+- **Units:** Injury-report records.
+- **Frequency:** Weekly, based on report dates.
+- **Time span:** At least four complete NBA seasons, depending on the availability of suitable historical data.
+- **Seasonal cycles:** At least four NBA seasons.
+
+The NBA data would be aggregated by week to produce a time series comparable to the NFL analysis. This would allow an investigation of whether weekly injury-report counts exhibit recurring patterns throughout NBA seasons and whether those counts can be forecast over a short horizon.
+
+As with the NFL data, injury-report counts may include repeated reports for the same player or injury. The backup dataset will therefore need a consistent definition of an injury report and sufficient historical observations before it can be used for forecasting.
+
+
