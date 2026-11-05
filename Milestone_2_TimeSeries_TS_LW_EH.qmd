@@ -1,0 +1,193 @@
+---
+title: "Milestone 2: Time Series"
+author: "Elijah Homan, Logan Worrell, Thomas Shields"
+format: 
+  html:
+    embed-resources: true
+---
+## Import and tidy. Show the code that reads your raw data and converts it to a tsibble. Note any missing values, implicit gaps (has_gaps(), fill_gaps()), or changes in how the series was measured, and say how you handled them.
+
+```{r}
+#| label: building_data
+#| echo: true
+#| warning: false
+
+library(nflreadr)
+library(tidyverse)
+library(fpp3)
+
+# Load NFL injury reports from 2016–2025
+injuries <- load_injuries(2016:2025)
+
+# Check missing values in important raw-data columns
+injuries |>
+  summarise(
+    missing_season = sum(is.na(season)),
+    missing_week = sum(is.na(week)),
+    missing_primary_injury = sum(is.na(report_primary_injury))
+  )
+
+# Create weekly injury-report counts
+weekly_injuries <- injuries |>
+  filter(week %in% 1:17) |>
+  filter(
+    !is.na(report_primary_injury),
+    report_primary_injury != "Not injury related - resting player"
+  ) |>
+  group_by(season, week) |>
+  summarise(
+    injury_reports = n(),
+    .groups = "drop"
+  ) |>
+  arrange(season, week) |>
+  mutate(
+    time = (season - 2016) * 17 + week,
+    week_label = paste0(season, " W", week)
+  ) |>
+  as_tsibble(index = time)
+
+# Check for missing values in the resulting time series
+weekly_injuries |>
+  summarise(
+    missing_injury_reports = sum(is.na(injury_reports))
+  )
+
+# Check for implicit gaps in the time series
+has_gaps(weekly_injuries, .full = TRUE)
+
+# Identify the specific gaps, if any
+scan_gaps(weekly_injuries)
+```
+The raw data were downloaded using `nflreadr::load_injuries()` for the 2016–2025 NFL seasons. We restricted the analysis to Weeks 1–17 of each season to maintain a consistent observation window across seasons. We also excluded reports classified as "Not injury related - resting player" and records with missing primary injury classifications.
+
+The data were grouped by season and week, and the number of injury reports was counted for each week. We created a numeric time index based on the season and week so that the observations remain in chronological order and missing weeks can be identified as gaps.
+
+We checked the resulting series for missing values and implicit gaps using `has_gaps()` and `scan_gaps()`. Since `has_gaps()` returned FALSE, we know our data does not have any gaps. We would like to point out, that we have a "gap" from week 17 back to week 1, but this is not an actual gap as the NFL does not play regular season games between these weeks. We did not automatically replace missing weeks with zero because a missing observation does not necessarily mean that no injuries were reported.
+
+## Transform, if needed. Decide whether a transformation (log, Box–Cox via guerrero, per-capita, inflation adjustment, calendar adjustment) is appropriate, and explain why (FPP3 §3.1).
+
+```{r}
+#| label: fig-nfl-injuries
+#| fig-cap: "Weekly NFL Injury Reports, 2016–2025"
+#| fig-width: 12
+#| fig-height: 6
+
+weekly_injuries |>
+  autoplot(injury_reports) +
+  scale_x_continuous(
+    breaks = weekly_injuries$time[weekly_injuries$week == 1],
+    labels = weekly_injuries$season[weekly_injuries$week == 1]
+  ) +
+  labs(
+    title = "Weekly NFL Injury Reports, 2016–2025",
+    x = "NFL Season",
+    y = "Number of Injury Reports"
+  ) +
+  theme_minimal()
+```
+
+A transformation is not necessary for this time series, so we will use the original injury-report counts. A log or Box–Cox transformation does not appear necessary because the plot does not show a clear increase in variability as the number of injury reports increases. We also chose not to use a per-capita adjustment because our goal is to forecast the total number of weekly injury reports rather than the rate of injuries per player. An inflation adjustment is not applicable because the data are counts rather than monetary values. Finally, a calendar adjustment is not needed because the data are measured weekly, and we restrict the analysis to Weeks 1–17 of each NFL season to maintain a consistent observation window. Basically, we aren't comparing October 2nd 2016 to any other October 2nd, but rather comparing the numerical weeks of the season, which always line up with previous years. Keeping the original scale also makes the forecasts easier to interpret in terms of the number of injury reports.
+
+## Visualize. Include at least three different plot types from Chapter 2 (for example, autoplot(), gg_season(), gg_subseries(), gg_lag(), ACF()), each with a sentence or two of interpretation.
+
+```{r}
+#| label: fig-seasonal
+
+seasonal_injuries <- weekly_injuries |>
+  as_tibble() |>
+  mutate(
+    week_of_season = week,
+    season = as.factor(season)
+  ) |>
+  as_tsibble(
+    key = season,
+    index = week_of_season
+  )
+
+seasonal_injuries |>
+  ggplot(aes(
+    x = week_of_season,
+    y = injury_reports,
+    color = season,
+    group = season
+  )) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks = 1:17) +
+  labs(
+    title = "NFL Injury Reports by Season and Week",
+    x = "Week of NFL Season",
+    y = "Number of Injury Reports",
+    color = "NFL Season"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+#| label: fig-subseries
+
+weekly_injuries |>
+  ggplot(aes(
+    x = factor(week),
+    y = injury_reports
+  )) +
+  geom_boxplot() +
+  labs(
+    title = "NFL Injury Reports by Week: Seasonal Subseries",
+    x = "Week of NFL Season",
+    y = "Number of Injury Reports"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+#| label: fig-lag
+
+weekly_injuries |>
+  gg_lag(injury_reports, lags = c(1, 2, 9, 17)) +
+  labs(
+    title = "Lag Plots of NFL Injury Reports",
+    x = "Previous Week's Injury Reports",
+    y = "Current Week's Injury Reports"
+  ) +
+  theme_minimal()
+```
+
+In all years, early season injuries are low, and they rise after a couple weeks, and stay fairly steady for the rest of the season. From the subseries, injuries start low in all the years, and increase dramatically until week 3, and then maintain those high injury rates throughout the season. There's a slight dip in median total injuries in weeks 9-14 for compared to the weeks prior and after. For the lag plot, we don't see much correlation, except for possibly lag 17, where there seems to be slight correlation between the same weeks of different years. 
+
+## Decompose. Fit an STL decomposition (§3.6), justify your window choices, and describe the trend and seasonal components. If your series is not seasonal, say so and explain how you know.
+
+```{r}
+#| label: stl-decomposition
+
+weekly_injuries |>
+  model(STL(injury_reports ~ trend(window = 7) +
+              season(period = 17, window = 7),
+            robust = TRUE)) |>
+  components() |>
+  autoplot()
+```
+
+We chose a window of 7 for both the trend and the seasonal components because the trend window of 7 allows it to capture quick short term fluctuations, and for the seasonal, it allows it to capture evolve slowly over time. The trend goes slightly down at the start, and then hovers around 150 for the rest of the years. The season always start low for the first week of the year, and then jumps up, and then hovers around that point for the most part until the next year. It doesn't look like the seasonal component captures all the seasonality, as the trend takes a dip each start of many new seasons.
+
+## Features. Compute and interpret a few relevant features from Chapter 4 (for example, feat_stl trend and seasonal strength, feat_acf).
+
+```{r}
+#| label: features
+
+weekly_injuries |> features(injury_reports, feat_stl, .period = 17)
+
+weekly_injuries |> features(injury_reports, feat_acf, .period = 17)
+
+weekly_injuries |> features(injury_reports, feat_spectral)
+
+weekly_injuries |> features(injury_reports, ljung_box)
+```
+
+We computed features using a seasonal period of 17, since each NFL regular season contributes 17 consecutive observations. STL-based features show moderate trend strength (0.41) and fairly strong seasonality (0.68), indicating that the week-of-season pattern, with low injury reports in Week 1 rising to a plateau by about Week 3, explains much of the variation. The seasonal trough occurs at Week 1. The autocorrelation features support this: lag-1 autocorrelation is 0.41 and the seasonal (lag-17) autocorrelation is 0.45, so both last week’s count and the same week of the prior season carry information. Second differencing produces strongly negative autocorrelation (-0.59), so at most one difference is appropriate for ARIMA. Spectral entropy is high (0.86), indicating a noisy series where forecast intervals will be wide, and the Ljung-Box test rejects white noise (p < 0.001), confirming there is structure to model. Together, these results suggest seasonal models (SNAIVE, seasonal ETS, seasonal ARIMA) are worth fitting and comparing.
+
+## Plan your evaluation. State how you will split your data into a training set and a test set, or how you will set up time series cross-validation (§5.8, §5.10). The test set should be at least as long as your forecast horizon.
+
+Our forecast horizon is 17 weeks, one full NFL regular season. We will hold out the 2025 season (17 observations, time 154-170) as the test set and train on 2016-2024 (153 observations). This makes the test set exactly as long as the forecast horizon and covers every week of the season once. Because we split on season boundaries, no season is cut in half, and the training data always come before the test data, so no future information leaks into the fit.
+
+Because a single test season may be unrepresentative, we will also use time series cross-validation. We will start with five seasons of training data (85 observations) and expand the training set by one season (17 observations) per fold, forecasting 17 weeks ahead each time. This gives five forecast origins, which makes our evaluation less dependent on any one season. We note that the 2020 season was affected by COVID-19 and falls within the training data and the early folds.
