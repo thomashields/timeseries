@@ -1,0 +1,243 @@
+---
+title: "Forecasting Weekly NFL Injury Reports"
+subtitle: "STAT 460/560 Group Project"
+author: "Elijah Homan, Logan Worrell, Thomas Shields"
+format:
+  revealjs:
+    embed-resources: true
+    slide-number: true
+    fig-width: 12
+    fig-height: 5.4
+    out-width: "100%"
+    include-in-header:
+      text: |
+        <style>
+          /* Smaller slide titles and bullets so the figures can use more of the slide */
+          .reveal .slides section h2 { font-size: 0.85em !important; margin: 0 0 0.1em 0 !important; }
+          .reveal .slides section ul { font-size: 0.8em !important; margin-top: 0.2em !important; }
+          .reveal .slides section p  { font-size: 0.8em !important; }
+          /* Slides with a figure: small bullets, figure fills the width */
+          .reveal .slides section:has(img) ul { font-size: 0.5em !important; margin-top: 0 !important; }
+          .reveal .slides section .cell,
+          .reveal .slides section .cell-output-display,
+          .reveal .slides section figure { margin: 0 !important; }
+          .reveal .slides section img { width: 100% !important; max-height: 76vh !important; object-fit: contain; }
+        </style>
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+
+library(nflreadr)
+library(tidyverse)
+library(fpp3)
+
+# Same data-building code as Milestones 2 and 3
+injuries <- load_injuries(2016:2025)
+
+weekly_injuries <- injuries |>
+  filter(week %in% 1:17) |>
+  filter(
+    !is.na(report_primary_injury),
+    report_primary_injury != "Not injury related - resting player"
+  ) |>
+  group_by(season, week) |>
+  summarise(injury_reports = n(), .groups = "drop") |>
+  arrange(season, week) |>
+  mutate(time = (season - 2016) * 17 + week) |>
+  as_tsibble(index = time)
+
+train <- weekly_injuries |> filter(time <= 153)
+
+# Larger text for slides
+theme_set(theme_minimal(base_size = 18))
+
+# x-axis breaks at Week 1 of each season (2016-2026)
+season_breaks <- (0:10) * 17 + 1
+season_labels <- 2016:2026
+```
+
+## The question
+
+- Has the number of NFL injury reports per week changed since 2016?
+- How many injury reports should we expect each week next season?
+- Who cares: the NFL and the NFL Players Association (player safety),
+  and team medical staffs planning for a 17-week season.
+- Forecast horizon: 17 weeks, one full regular season.
+
+::: notes
+Speaker: [name]. Motivate the question and the decision-maker. About 1 minute.
+:::
+
+## The data
+
+```{r}
+#| label: plot-series
+
+weekly_injuries |>
+  autoplot(injury_reports) +
+  scale_x_continuous(
+    breaks = season_breaks[1:10],
+    labels = season_labels[1:10]
+  ) +
+  labs(
+    title = "Weekly NFL injury reports, Weeks 1–17, 2016–2025",
+    x = "Season",
+    y = "Injury reports"
+  )
+```
+
+- Source: nflverse injury reports (`nflreadr`), 170 weeks; resting-player reports excluded.
+- No long-run trend after 2016; 2016 is unusually high.
+
+::: notes
+Speaker: [name]. Explain what one observation is (a count of injury-report records in one
+week), and that seasons are joined end to end with no off-season gap.
+:::
+
+## A strong week-of-season pattern
+
+```{r}
+#| label: plot-season
+
+weekly_injuries |>
+  as_tibble() |>
+  ggplot(aes(x = week, y = injury_reports, group = season, color = factor(season))) +
+  geom_line(alpha = 0.7) +
+  scale_x_continuous(breaks = 1:17) +
+  labs(
+    title = "Each season, Week 1 is far lower than the rest",
+    x = "Week of season",
+    y = "Injury reports",
+    color = "Season"
+  )
+```
+
+- Week 1 is low every season; counts plateau from about Week 3 on.
+- Seasonal strength 0.68: the season shape explains much of the variation.
+
+::: notes
+Speaker: [name]. This is why every model uses a 17-week seasonal period. Mention briefly
+that gg_season() does not work on our week index, so we built this plot by hand.
+:::
+
+## Models and how we compared them
+
+- Benchmarks: mean, naive, seasonal naive, random walk with drift
+- Exponential smoothing: ETS(M,Ad,A)
+- ARIMA(1,1,1)(2,1,0)[17]
+- Regression: trend plus week-of-season dummies
+- Test set: the 2025 season (train on 2016–2024)
+- Time series cross-validation: 5 folds, each forecasting a full season
+- Measures: RMSE, MAE, MASE and CRPS
+
+Our prediction: ETS or regression would win, because they average the season shape over many years.
+
+::: notes
+Speaker: [name]. Keep this quick; the audience knows the methods. Emphasize that the
+test set is exactly one forecast horizon and that CV gives five more checks.
+:::
+
+## Results: the simplest seasonal model wins
+
+```{r}
+#| label: plot-accuracy
+
+models <- function(data) {
+  data |>
+    model(
+      Mean = MEAN(injury_reports),
+      Naive = NAIVE(injury_reports),
+      `Seasonal naive` = SNAIVE(injury_reports ~ lag(17)),
+      Drift = RW(injury_reports ~ drift()),
+      ETS = ETS(injury_reports ~ season(period = 17)),
+      ARIMA = ARIMA(injury_reports ~ PDQ(period = 17)),
+      Regression = TSLM(injury_reports ~ trend() + season(period = 17))
+    )
+}
+
+acc_test <- train |>
+  models() |>
+  forecast(h = 17) |>
+  accuracy(weekly_injuries, measures = list(RMSE = RMSE), .period = 17) |>
+  mutate(evaluation = "2025 test season")
+
+acc_cv <- weekly_injuries |>
+  stretch_tsibble(.init = 85, .step = 17) |>
+  filter(.id < max(.id)) |>
+  models() |>
+  forecast(h = 17) |>
+  accuracy(weekly_injuries, measures = list(RMSE = RMSE), .period = 17) |>
+  mutate(evaluation = "Cross-validation (5 seasons)")
+
+bind_rows(acc_test, acc_cv) |>
+  ggplot(aes(x = RMSE, y = reorder(.model, -RMSE), fill = evaluation)) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "Forecast error by model (lower is better)",
+    x = "RMSE (injury reports per week)",
+    y = NULL,
+    fill = NULL
+  ) +
+  theme(legend.position = "bottom")
+```
+
+- Seasonal naive has the lowest error on the 2025 season and in cross-validation.
+- This surprised us: it beat our predicted winners.
+
+::: notes
+Speaker: [name]. Seasonal naive RMSE is about 19 on 2025 vs. 21 for ETS. Explain why:
+once the Week 1 drop is captured, most of what is left is noise, and the complex models
+are pulled up by the high 2016 season.
+:::
+
+## Forecast for the 2026 season
+
+```{r}
+#| label: plot-forecast
+
+fit_full <- weekly_injuries |>
+  model(snaive = SNAIVE(injury_reports ~ lag(17)))
+
+fc_2026 <- fit_full |> forecast(h = 17)
+
+fc_2026 |>
+  autoplot(weekly_injuries |> filter(time > 119), level = c(80, 95)) +
+  scale_x_continuous(
+    breaks = season_breaks[8:11],
+    labels = season_labels[8:11]
+  ) +
+  labs(
+    title = "Seasonal naive forecast with 80% and 95% prediction intervals",
+    x = "Season",
+    y = "Injury reports"
+  )
+```
+
+- Expect about 80 reports in Week 1, mostly 110–165 per week in Weeks 2–15,
+  and up to about 210 in Weeks 16–17.
+- The 95% intervals are wide: about ±44 reports per week.
+- Seasonal naive repeats 2025, including its unusually high final weeks.
+
+::: notes
+Speaker: [name]. Refit on all ten seasons. Read the forecast in plain language: what
+a typical week will look like, and how uncertain that is. Check the numbers on this
+slide against the plot after rendering.
+:::
+
+## Takeaways and limitations
+
+- Weekly injury reports have been flat since 2017; there is no evidence of a rise or fall.
+- The season shape (a quiet Week 1, then a plateau) is predictable; week-to-week swings are not.
+- For planning, last season's weekly counts are as good a guide as any model we tried.
+- Main limitation: counts are reports, not distinct injuries, and the forecasts
+  are uncertain (wide intervals).
+
+::: notes
+Speaker: [name]. End on the answer to the question for the decision-maker. Leave time for
+2 minutes of questions.
+:::
