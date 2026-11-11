@@ -1,0 +1,402 @@
+---
+title: "Milestone 3: Modeling Checkpoint"
+author: "Elijah Homan, Logan Worrell, Thomas Shields"
+format:
+  html:
+    embed-resources: true
+    toc: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+## Data and training/test split
+
+We use the same data-building code as Milestone 2: weekly counts of NFL injury-report
+records for Weeks 1–17 of the 2016–2025 regular seasons, excluding resting-player reports
+and records with no primary injury listed. Following our evaluation plan, the 2016–2024
+seasons (`time` 1–153) form the training set and the 2025 season (`time` 154–170, one full
+17-week forecast horizon) is the test set.
+
+```{r}
+#| label: building_data
+
+library(nflreadr)
+library(tidyverse)
+library(fpp3)
+
+# Load NFL injury reports from 2016–2025
+injuries <- load_injuries(2016:2025)
+
+# Create weekly injury-report counts
+weekly_injuries <- injuries |>
+  filter(week %in% 1:17) |>
+  filter(
+    !is.na(report_primary_injury),
+    report_primary_injury != "Not injury related - resting player"
+  ) |>
+  group_by(season, week) |>
+  summarise(
+    injury_reports = n(),
+    .groups = "drop"
+  ) |>
+  arrange(season, week) |>
+  mutate(
+    time = (season - 2016) * 17 + week,
+    week_label = paste0(season, " W", week)
+  ) |>
+  as_tsibble(index = time)
+
+# Training set: 2016–2024 seasons; test set: 2025 season
+train <- weekly_injuries |> filter(time <= 153)
+test  <- weekly_injuries |> filter(time > 153)
+```
+
+### A note on the seasonal period
+
+NFL regular-season weeks are not evenly spaced on the calendar: each season is followed by
+roughly 35 weeks with no games. A date-based index (such as `yearweek`) would leave large
+gaps in the series every off-season. We therefore index the series with a consecutive integer
+`time` (1–170), so that Week 1 of one season directly follows Week 17 of the previous season.
+
+The cost of this choice is that an integer index carries no calendar information, so fable
+and feasts cannot infer the seasonal period on their own. `gg_season()` and `gg_subseries()`
+fail on this index (they convert the period into calendar time), and an automatic `ETS()`
+with no period specified silently fits a non-seasonal model. To avoid this, every model
+below states the seasonal period of 17 weeks explicitly (`lag(17)`, `season(period = 17)`,
+`PDQ(period = 17)`), and we built the seasonal plots by hand with ggplot. The plot below is
+our stand-in for `gg_subseries()`: one panel per week of the season, with the blue line
+showing that week's average across seasons.
+
+```{r}
+#| label: fig-subseries
+#| fig-width: 12
+#| fig-height: 4
+
+weekly_injuries |>
+  as_tibble() |>
+  group_by(week) |>
+  mutate(week_mean = mean(injury_reports)) |>
+  ggplot(aes(x = season, y = injury_reports)) +
+  geom_line() +
+  geom_hline(aes(yintercept = week_mean), color = "blue") +
+  facet_wrap(~ week, nrow = 1, labeller = label_both) +
+  scale_x_continuous(breaks = c(2016, 2025)) +
+  labs(
+    title = "Seasonal Subseries of NFL Injury Reports (Weeks 1–17)",
+    x = "Season",
+    y = "Number of Injury Reports"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, size = 7))
+```
+
+Week 1 is far below every other week in every season, and Weeks 2–17 sit at a similar level.
+Within each week, counts move around from season to season without a clear upward or
+downward trend.
+
+## Predict first
+
+Milestone 2 shows a strong, stable week-of-season pattern (seasonal strength 0.68, with a
+low Week 1) and no long-run trend after 2016. We therefore expect a model that estimates a
+smooth seasonal profile from many seasons to beat all four benchmarks. This could be ETS with
+an additive seasonal component or a regression on week dummies. We expect the seasonal naive
+method to come close but lose, because it copies only last season's noisy values. We expect
+NAIVE and drift to do worst, because they cannot reproduce the Week 1 drop.
+
+## Model fitting
+
+We fit seven models to the training set: four benchmarks, ETS, ARIMA and a regression
+model. Each model that uses seasonality is given the 17-week seasonal period explicitly.
+
+```{r}
+#| label: fit-models
+
+fit <- train |>
+  model(
+    mean   = MEAN(injury_reports),
+    naive  = NAIVE(injury_reports),
+    snaive = SNAIVE(injury_reports ~ lag(17)),
+    drift  = RW(injury_reports ~ drift()),
+    ets    = ETS(injury_reports ~ season(period = 17)),
+    arima  = ARIMA(injury_reports ~ PDQ(period = 17)),
+    tslm   = TSLM(injury_reports ~ trend() + season(period = 17))
+  )
+```
+
+### Benchmarks
+
+- MEAN forecasts every future week as the average of all training weeks.
+- NAIVE forecasts every future week as the last observed value (Week 17 of 2024).
+- SNAIVE forecasts each week of 2025 as the value from the same week of 2024.
+- RW with drift extends a straight line from the first to the last observation.
+
+Only SNAIVE can reproduce the low Week 1, so we expect it to be the strongest benchmark.
+
+### Exponential smoothing
+
+```{r}
+#| label: ets-report
+
+fit |> select(ets)
+
+fit |>
+  select(ets) |>
+  tidy() |>
+  filter(term %in% c("alpha", "beta", "gamma", "phi"))
+```
+
+Automatic selection chose ETS(M,Ad,A):
+
+- Error (M), multiplicative: the size of the random week-to-week variation is
+  proportional to the level of the series.
+- Trend (Ad), additive damped: the model allows a trend, but it flattens out
+  (φ ≈ 0.93). The initial slope is negative, which reflects the drop from the high
+  2016 season (average ≈ 176 reports per week) to roughly 140–150 in later seasons. Because the
+  trend is damped, the model does not project that decline forward.
+- Season (A), additive, period 17: each week of the season gets a fixed number of reports
+  above or below the level. The Week 1 effect is about −58 reports. Weeks 2–17 lie
+  mostly within ±20 of the level.
+
+All three smoothing parameters (α, β, γ) are close to zero. This means the level, trend and
+seasonal pattern hardly change over time. In effect, the model fits one fixed season shape
+to all nine training seasons.
+
+### ARIMA
+
+Following FPP3 §9.1 and §9.5, we first use `unitroot_nsdiffs` to decide whether a
+seasonal difference is needed. We then apply it and use the KPSS test and `unitroot_ndiffs`
+on the seasonally differenced series to decide whether a further first difference is needed.
+
+```{r}
+#| label: unitroot
+
+# Seasonal differences needed?
+train |> features(injury_reports, unitroot_nsdiffs, .period = 17)
+
+# KPSS test and first differences needed, after a seasonal difference
+train |>
+  mutate(diff_injuries = difference(injury_reports, lag = 17)) |>
+  features(diff_injuries, list(unitroot_kpss, unitroot_ndiffs))
+```
+
+`unitroot_nsdiffs` suggests one seasonal difference (lag 17), because the seasonal
+strength is high. After seasonal differencing, the KPSS test rejects stationarity at the 5%
+level (p ≈ 0.02), and `unitroot_ndiffs` suggests one further first difference. Milestone 2
+also found that a second difference produces strongly negative autocorrelation (−0.59), so
+more than one first difference would be too many.
+
+```{r}
+#| label: arima-report
+
+fit |> select(arima) |> report()
+```
+
+Automatic selection chose ARIMA(1,1,1)(2,1,0)[17]. `ARIMA()` chooses the differencing
+with the same unit-root tests shown above (D = 1, d = 1). It then chooses the AR and MA orders
+by minimizing AICc. The model has one non-seasonal AR term, one non-seasonal MA term, and two
+seasonal AR terms. In words: the model forecasts each week
+from changes relative to the same week last season, corrected by recent weeks' changes
+and by the seasonal changes of the previous two seasons.
+
+### Regression
+
+Our data have no outside predictor series, so the regression model is a TSLM with a linear
+trend and 16 week-of-season dummy variables:
+
+$$
+y_t = \beta_0 + \beta_1 t + \sum_{j=2}^{17} \gamma_j \, d_{j,t} + \varepsilon_t ,
+$$
+
+where $d_{j,t} = 1$ if observation $t$ falls in Week $j$. All future values of the
+predictors (the time index and the week number) are known in advance, so this model has no
+ex-ante forecasting problem. If we later add a real predictor, such as the number of games played
+on short rest, we would need forecasts of that predictor (ex-ante). Otherwise we could only
+report ex-post accuracy using its observed values (FPP3 §7.6).
+
+## Forecast accuracy
+
+### Test set (2025 season)
+
+```{r}
+#| label: fig-test-forecasts
+#| fig-width: 12
+#| fig-height: 5
+
+fc <- fit |> forecast(h = 17)
+
+fc |>
+  filter(.model %in% c("snaive", "ets", "arima", "tslm")) |>
+  autoplot(weekly_injuries |> filter(time > 119), level = NULL) +
+  labs(
+    title = "Forecasts of the 2025 Season vs. Actual Injury Reports",
+    x = "Time (consecutive NFL week, 2023–2025 shown)",
+    y = "Number of Injury Reports",
+    color = "Model"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+#| label: accuracy-test
+
+acc_measures <- list(RMSE = RMSE, MAE = MAE, MASE = MASE, CRPS = CRPS)
+
+acc_test <- accuracy(fc, weekly_injuries, measures = acc_measures, .period = 17) |>
+  select(-.type)
+```
+
+We compute RMSE, MAE, MASE and CRPS for each model. MASE is scaled by the seasonal naive
+errors on the training data, using the 17-week period.
+
+### Time series cross-validation
+
+The single 2025 season could be unrepresentative, so we also use the expanding-window
+cross-validation from our evaluation plan. The first training set is the first five seasons
+(85 weeks), and each fold adds one season. Each fold forecasts the next 17 weeks, which gives
+five forecast origins with training sets ending in 2020, 2021, 2022, 2023 and 2024.
+
+```{r}
+#| label: cross-validation
+
+cv_data <- weekly_injuries |>
+  stretch_tsibble(.init = 85, .step = 17) |>
+  filter(.id < max(.id))   # drop the last fold, which has no future data to test on
+
+cv_fit <- cv_data |>
+  model(
+    mean   = MEAN(injury_reports),
+    naive  = NAIVE(injury_reports),
+    snaive = SNAIVE(injury_reports ~ lag(17)),
+    drift  = RW(injury_reports ~ drift()),
+    ets    = ETS(injury_reports ~ season(period = 17)),
+    arima  = ARIMA(injury_reports ~ PDQ(period = 17)),
+    tslm   = TSLM(injury_reports ~ trend() + season(period = 17))
+  )
+
+cv_fc <- cv_fit |> forecast(h = 17)
+
+acc_cv <- accuracy(cv_fc, weekly_injuries, measures = acc_measures, .period = 17) |>
+  select(-.type)
+```
+
+### Accuracy comparison
+
+```{r}
+#| label: accuracy-table
+
+# Accuracy on the 2025 test season and averaged over five CV folds (lower is better)
+left_join(acc_test, acc_cv, by = ".model", suffix = c("_test", "_cv")) |>
+  arrange(RMSE_cv) |>
+  rename(Model = .model) |>
+  mutate(across(where(is.numeric), \(x) round(x, 2))) |>
+  print(width = Inf)
+```
+
+The table above shows accuracy on the 2025 test season (`_test`) and averaged over the five
+cross-validation folds (`_cv`); lower is better. Our leading model is the seasonal naive
+method (SNAIVE). On the 2025 test season it has the lowest value on all four measures, with an
+RMSE of 18.9 compared with 21.0 for the next-best model, ETS. In cross-validation it again has
+the lowest RMSE and CRPS. The regression model is a close second and essentially ties SNAIVE
+on MAE and MASE. ETS and ARIMA beat the MEAN, NAIVE and drift benchmarks, but not SNAIVE.
+NAIVE and drift are by far the worst, because they forecast a high value for Week 1. Since
+ETS, ARIMA and the regression model do not beat the seasonal naive benchmark, none of them is
+yet worth using in its place.
+
+This result contradicts our prediction. Our interpretation is that the week-of-season shape
+is the only part of the series that can be forecast reliably. Once a model captures the
+Week 1 drop, most of the remaining variation is noise (Milestone 2 found a spectral entropy of
+0.86). The extra parameters in ETS and ARIMA therefore add complexity without adding accuracy.
+These models are also pulled upward by the unusually high 2016 season, which SNAIVE ignores
+because it uses only the most recent season.
+
+## Residual diagnostics for the leading model
+
+```{r}
+#| label: fig-snaive-resid
+#| fig-width: 10
+#| fig-height: 6
+
+fit |>
+  select(snaive) |>
+  gg_tsresiduals(lag_max = 51) +
+  labs(title = "Residuals of the Seasonal Naive Model (training data)")
+```
+
+```{r}
+#| label: ljung-box
+
+# Ljung-Box with lag = 2 x seasonal period; SNAIVE estimates no parameters (dof = 0)
+fit |>
+  select(snaive) |>
+  augment() |>
+  features(.innov, ljung_box, lag = 34, dof = 0)
+
+# For comparison: the ARIMA model (4 estimated coefficients)
+fit |>
+  select(arima) |>
+  augment() |>
+  features(.innov, ljung_box, lag = 34, dof = 4)
+```
+
+The SNAIVE residuals are the season-over-season changes in each week's count (this season's
+Week k minus last season's Week k). The model is unbiased overall: the residuals center
+near zero and show no trend. However, they come in runs. For example, the first season of
+residuals (2017 minus 2016) is almost entirely negative, reflecting the drop after the
+unusually high 2016 season. Other seasons sit mostly above or mostly below zero.
+
+The ACF confirms this. Autocorrelations at lags 1–3 are clearly positive (about 0.43 at
+lag 1), so a week whose count is above last season's tends to be followed by more such weeks.
+In other words, whole seasons shift up or down in level. There is also a negative spike at
+lag 17 (about −0.32), which is typical of a seasonal-difference model: an unusually high week
+this season makes next season's residual for that week negative. The Ljung–Box test
+(lag 34, p < 0.001) strongly rejects white noise, so SNAIVE leaves usable structure in the
+residuals, mainly the season-level shifts. The histogram is roughly symmetric and
+bell-shaped, so normal prediction intervals are reasonable. However, the residuals are large
+(mostly within ±40 reports), so the intervals will be wide.
+
+The second Ljung–Box test above is for the ARIMA model, whose residuals pass (p ≈ 0.11).
+ARIMA therefore captures the autocorrelation in the training data better than SNAIVE, yet
+SNAIVE forecasts the 2025 season more accurately. The forecast plot shows where ARIMA goes
+wrong: its forecasts are too high for most of Weeks 2–8. We return to this tension below.
+
+## Status and open questions
+
+(a) Who led each part
+
+- Data import and test/CV setup: Thomas
+- Benchmarks and ETS: Logan
+- ARIMA and unit-root tests: Thomas
+- Regression, accuracy table and diagnostics: Logan
+- Writing and editing: Eli
+
+(b) The problem we are most stuck on
+
+Our main difficulty is the time index. We index the series by consecutive NFL week rather
+than by calendar date, which avoids a 35-week gap every off-season. The drawback is that
+fable and feasts cannot detect the 17-week season on their own. As a result, `gg_season()`
+and `gg_subseries()` fail, and `ETS()` fits a non-seasonal model unless the period is given.
+We tried converting the index to fake daily dates. The plots then ran, but they treated each
+7-day block as a season, which is wrong. Our current solution is to specify `period = 17` in
+every model and to draw the seasonal plots directly with ggplot. We would appreciate feedback
+on whether this is an acceptable approach.
+
+(c) What we plan to try before the final report
+
+SNAIVE forecasts best even though its residuals are autocorrelated, while ARIMA passes the
+Ljung–Box test but forecasts worse. We suspect the unusually high 2016 season and overfitting
+of noise are responsible. To test this, we plan to:
+
+- Repeat the comparison without the 2016 season, or with a 2016 level-shift dummy, to see
+  whether ETS, ARIMA and the regression model then outperform SNAIVE.
+- Fit a dynamic regression model (week dummies with ARIMA errors) and a simpler seasonal
+  structure: a Week 1 dummy with a common level for Weeks 2–17.
+- Examine era effects, including the 2020 COVID season and the move to an 18-week schedule
+  in 2021 (we currently keep Weeks 1–17 only).
+- Check whether a log or Box–Cox transformation improves the prediction intervals.
+- Re-fit the final model on all ten seasons and produce 2026 forecasts with 80% and 95%
+  prediction intervals.
+
+
+
